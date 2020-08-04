@@ -18,20 +18,19 @@ require('three/examples/js/loaders/TGALoader');
 require('three/examples/js/loaders/MMDLoader');
 require('three/examples/js/animation/CCDIKSolver');
 require('three/examples/js/animation/MMDPhysics');
+require('three/examples/js/animation/MMDAnimationHelper');
 
 // used in MMDLoader
 var MMDParser = require('mmd-parser');
 if (window) window.MMDParser = MMDParser;
 
 var mmdLoader = new THREE.MMDLoader();
-mmdLoader.setTextureCrossOrigin('anonymous');
-
-var mmdHelper = new THREE.MMDHelper();
+var mmdHelper = new THREE.MMDAnimationHelper();
 
 AFRAME.registerComponent('mmd', {
   schema: {
     audio: {
-      type: 'string'
+      type: 'asset'
     },
     autoplay: {
       type: 'boolean',
@@ -54,7 +53,7 @@ AFRAME.registerComponent('mmd', {
   init: function () {
     var self = this;
     this.playing = false;
-    this.loader = mmdLoader;
+    this.loader = new THREE.AudioLoader();
     this.helper = null;
     this.el.addEventListener('model-loaded', function() {
       self.setupModelsIfReady();
@@ -69,12 +68,13 @@ AFRAME.registerComponent('mmd', {
   },
 
   remove: function () {
-    this.cleanupHelper();
+    this.stop();
+    this.helper = null;
   },
 
   tick: function (time, delta) {
     if (!this.playing) { return; }
-    this.helper.animate(delta / 1000);
+    this.helper.update(delta / 1000);
   },
 
   play: function () {
@@ -103,60 +103,48 @@ AFRAME.registerComponent('mmd', {
   },
 
   setupHelper: function () {
-    // one MMDHelper instance per a mmd component
-    this.helper = new THREE.MMDHelper();
-  },
+    var afterglow = this.data.afterglow;
+    var params = {};
+    if (afterglow !== 0) {
+      params.afterglow = afterglow;
+    }
 
-  cleanupHelper: function () {
-    this.stop();
-    this.helper = null;
+    // one MMDHelper instance per a mmd component
+    this.helper = new THREE.MMDAnimationHelper(params);
   },
 
   load: function () {
-    var self = this;
     var audioUrl = this.data.audio;
+    if (audioUrl === '') { return; }
+
+    var self = this;
     var volume = this.data.volume;
     var audioDelayTime = this.data.audioDelayTime;
     var loader = this.loader;
     var helper = this.helper;
 
-    function loadAudio () {
-      loader.loadAudio(audioUrl, function (audio, listener) {
-        if (volume !== 1.0) { audio.setVolume(volume); }
-        listener.position.z = 1;
+    loader.load(audioUrl, function (buffer) {
+      var listener = new THREE.AudioListener();
+      var audio = new THREE.Audio(listener).setBuffer(buffer);
 
-        var params = {};
-        if (audioDelayTime !== 0) {
-          params.delayTime = audioDelayTime;
-        }
-        helper.setAudio(audio, listener, params);
+      if (volume !== 1.0) { audio.setVolume(volume); }
+      listener.position.z = 1;
 
-        self.setupModelsIfReady();
-      });
-    }
+      var params = {};
+      if (audioDelayTime !== 0) {
+        params.delayTime = audioDelayTime;
+      }
+      helper.add(audio, params);
 
-    if (audioUrl !== '') {
-      loadAudio();
-    }
+      self.setupModelsIfReady();
+    });
   },
 
   getMMDEntities: function () {
-    var el = this.el;
-    var entities = el.querySelectorAll('a-entity');
-
-    var readIndex = 0;
-    var writeIndex = 0;
-    for(var i = 0, il = entities.length; i < il; i++) {
-      var entity = entities[i];
-      if (entity.getAttribute('mmd-model') !== null) {
-        entities[writeIndex] = entities[readIndex];
-        writeIndex++;
-      }
-      readIndex++;
-    }
-    entities.length = writeIndex;
-
-    return entities;
+    var entities = this.el.querySelectorAll('a-entity, a-mmd-model');
+    return Array.from(entities).filter(function (entity) {
+      return entity.getAttribute('mmd-model') !== null;
+    });
   },
 
   setupModelsIfReady: function () {
@@ -184,7 +172,6 @@ AFRAME.registerComponent('mmd', {
 
   setupModels: function () {
     var helper = this.helper;
-    var afterglow = this.data.afterglow;
     var autoplay = this.data.autoplay;
 
     var entities = this.getMMDEntities();
@@ -192,16 +179,9 @@ AFRAME.registerComponent('mmd', {
     for(var i = 0, il = entities.length; i < il; i++) {
       var mesh = entities[i].getObject3D('mesh');
       if (mesh !== undefined) {
-        helper.setAnimation(mesh);
-        helper.add(mesh);
+        helper.add(mesh, mesh.params);
       }
     }
-
-    var params = {};
-    if (afterglow !== 0) {
-      params.afterglow = afterglow;
-    }
-    helper.unifyAnimationDuration(params);
 
     // blink animation duration should be independent of other animations.
     // so set it after we call unifyAnimationDuration().
@@ -220,7 +200,6 @@ AFRAME.registerComponent('mmd', {
 
     this.removeBlinkFromMorphAnimations(mesh, blinkMorphName);
 
-    var loader = this.loader;
     var offset = (Math.random() * 10) | 0;
 
     var vmd = {
@@ -250,27 +229,28 @@ AFRAME.registerComponent('mmd', {
       cameras: [],
       motions: []
     };
-    loader.pourVmdIntoModel(mesh, vmd, 'blink');
-    if (mesh.mixer === null || mesh.mixer === undefined) {
-      mesh.mixer = new THREE.AnimationMixer(mesh);
+    var animation = mmdLoader.animationBuilder.build(vmd, mesh);
+    mesh.params.animation.push(animation);
+
+    var objects = this.helper.objects.get(mesh);
+    if (objects.mixer === null || objects.mixer === undefined) {
+      objects.mixer = new THREE.AnimationMixer(mesh);
     }
-    var animations = mesh.geometry.animations;
-    var clip = animations[animations.length-1];;
-    var action = mesh.mixer.clipAction(clip);
+    var action = objects.mixer.clipAction(animation);
     action.play();
-    action.weight = animations.length;
+    action.weight = mesh.params.animation.length;
   },
 
   removeBlinkFromMorphAnimations: function (mesh, blinkMorphName) {
-    if (mesh.geometry.animations === undefined) { return; }
+    if (mesh.params.animation === undefined) { return; }
     if (mesh.morphTargetDictionary === undefined) { return; }
 
     var index = mesh.morphTargetDictionary[ blinkMorphName ];
 
     if (index === undefined) { return; }
 
-    for (var i = 0, il = mesh.geometry.animations.length; i < il; i++ ) {
-      var tracks = mesh.geometry.animations[i].tracks;
+    for (var i = 0, il = mesh.params.animation.length; i < il; i++ ) {
+      var tracks = mesh.params.animation[i].tracks;
       for (var j = 0, jl = tracks.length; j < jl; j++) {
         if (tracks[j].name === '.morphTargetInfluences[' + index + ']') {
           tracks.splice(j, 1);
@@ -309,8 +289,7 @@ AFRAME.registerComponent('mmd-model', {
   },
 
   update: function () {
-    var data = this.data;
-    if (!data.model) { return; }
+    if (!this.data.model) { return; }
     this.remove();
     this.load();
   },
@@ -321,9 +300,11 @@ AFRAME.registerComponent('mmd-model', {
   },
 
   load: function () {
+    var modelUrl = this.data.model;
+    if (modelUrl === '') { return; }
+
     var self = this;
     var el = this.el;
-    var modelUrl = this.data.model;
     var vpdUrl = this.data.vpd;
     var vmdUrl = this.data.vmd;
     var physicsFlag = this.data.physics;
@@ -331,12 +312,11 @@ AFRAME.registerComponent('mmd-model', {
     var helper = this.helper;
 
     function loadModel () {
-      loader.loadModel(modelUrl, function (object) {
-        var mesh = object;
-
-        if (physicsFlag) {
-          helper.setPhysics(mesh);
-        }
+      loader.load(modelUrl, function (mesh) {
+        mesh.params = {
+          animation: [],
+          physics: physicsFlag
+        };
 
         if (vmdUrl !== '') {
           loadVmd(mesh);
@@ -349,16 +329,16 @@ AFRAME.registerComponent('mmd-model', {
     }
 
     function loadVpd (mesh) {
-      loader.loadVpd(vpdUrl, function (vpd) {
-        helper.poseAsVpd(mesh, vpd);
+      loader.loadVPD(vpdUrl, false, function (vpd) {
+        helper.pose(mesh, vpd);
         setup(mesh);
       });
     }
 
     function loadVmd (mesh) {
       var urls = vmdUrl.replace(/\s/g, '').split(',');
-      loader.loadVmds(urls, function (vmd) {
-        loader.pourVmdIntoModel(mesh, vmd);
+      loader.loadAnimation(urls, mesh, function (animation) {
+        mesh.params.animation.push(animation);
         setup(mesh);
       });
     }
@@ -372,6 +352,26 @@ AFRAME.registerComponent('mmd-model', {
       el.emit('model-loaded', {format: 'mmd', model: mesh});
     }
 
-    if (modelUrl !== '') { loadModel(); }
+    loadModel();
+  }
+});
+
+AFRAME.registerPrimitive('a-mmd', {
+  mappings: {
+    'audio'            : 'mmd.audio',
+    'autoplay'         : 'mmd.autoplay',
+    'volume'           : 'mmd.volume',
+    'audio-delay-time' : 'mmd.audioDelayTime',
+    'afterglow'        : 'mmd.afterglow'
+  }
+});
+
+AFRAME.registerPrimitive('a-mmd-model', {
+  mappings: {
+    'model'   : 'mmd-model.model',
+    'vpd'     : 'mmd-model.vpd',
+    'vmd'     : 'mmd-model.vmd',
+    'physics' : 'mmd-model.physics',
+    'blink'   : 'mmd-model.blink'
   }
 });
